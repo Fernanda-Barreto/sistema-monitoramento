@@ -33,11 +33,13 @@ CAPTURE_INTERVAL_SECONDS = 5
 background_subtractor = cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=16, detectShadows=True)
 MOTION_THRESHOLD_AREA = 500  # Área mínima para considerar movimento
 
-# Limites de detecção de pessoa (calibrados para maior flexibilidade)
-CONFIDENCE_THRESHOLD = 0.55  # Aceita detecções com 55% de confiança
-MIN_WIDTH = 40
-MIN_HEIGHT = 80
-MIN_ASPECT_RATIO = 1.0
+# Limites de detecção de pessoa (CALIBRAGEM DE DISTÂNCIA)
+CONFIDENCE_THRESHOLD = 0.60  # Aceita detecções com 60% de confiança
+MIN_WIDTH = 50       # Largura mínima para uma detecção
+MIN_HEIGHT = 100     # Altura mínima para uma detecção
+MAX_WIDTH = 400      # **Largura MÁXIMA para uma detecção (novo)**
+MAX_HEIGHT = 700     # **Altura MÁXIMA para uma detecção (novo)**
+MIN_ASPECT_RATIO = 1.5 # Relação mínima entre altura/largura
 
 while True:
     ret, frame = cap.read()
@@ -45,12 +47,12 @@ while True:
         print("Aviso: Falha ao capturar o frame. Tentando novamente...")
         continue
 
-    # 1. Pré-processamento: Reduz o ruído para uma detecção de movimento mais precisa
+    # 1. Pré-processamento: Reduz o ruído
     blurred_frame = cv2.GaussianBlur(frame, (21, 21), 0)
 
     # 2. Detecção de movimento
     fg_mask = background_subtractor.apply(blurred_frame)
-    fg_mask = cv2.threshold(fg_mask, 250, 255, cv2.THRESH_BINARY)[1] # Filtra apenas áreas brancas
+    fg_mask = cv2.threshold(fg_mask, 250, 255, cv2.THRESH_BINARY)[1]
     fg_mask = cv2.dilate(fg_mask, None, iterations=2)
     contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -74,8 +76,11 @@ while True:
                 width = x2 - x1
                 height = y2 - y1
 
-                # Aplica filtros de tamanho e proporção
-                if width >= MIN_WIDTH and height >= MIN_HEIGHT and (height / width) >= MIN_ASPECT_RATIO:
+                # Aplica todos os filtros, incluindo os novos limites MÁXIMOS
+                if width >= MIN_WIDTH and height >= MIN_HEIGHT and \
+                   width <= MAX_WIDTH and height <= MAX_HEIGHT and \
+                   (height / width) >= MIN_ASPECT_RATIO:
+                    
                     person_confirmed = True
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                     cv2.putText(frame, f'Pessoa: {confidence:.2f}', (x1, y1 - 10),
