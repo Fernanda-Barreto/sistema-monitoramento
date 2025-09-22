@@ -1,0 +1,7 @@
+# ROI polygon — pontos (x, y) no referencial do frame (largura x altura)
+# Se vazio ou arquivo inexistente, o frame inteiro será considerado.
+polygon:
+  - [50, 50]
+  - [1230, 50]
+  - [1230, 670]
+  - [50, 670]

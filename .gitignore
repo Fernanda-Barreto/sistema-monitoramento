@@ -1,3 +1,10 @@
 .venv/
 venv/
-env/
+env/.env
+prints_eventos/
+logs/
+__pycache__/
+*.log
+*.pt
+.DS_Store
+Thumbs.db
