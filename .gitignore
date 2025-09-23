@@ -1,6 +1,7 @@
 .venv/
 venv/
 env/.env
+.env
 prints_eventos/
 logs/
 __pycache__/
