@@ -147,6 +147,7 @@ def init_camera(index=0, w=1280, h=720):
     return cap
 
 def main():
+    global SHOW_WINDOW
     logger.info("Iniciando Olhar Vivo (main.py atualizado)")
 
     # Modelo YOLO
