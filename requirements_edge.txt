@@ -1,5 +1,0 @@
-ultralytics>=8.0.0,<9
-opencv-python>=4.7
-PyYAML>=6.0
-requests>=2.31
-python-dotenv>=1.0
