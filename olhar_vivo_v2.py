@@ -22,10 +22,11 @@ import yaml
 import numpy as np
 import logging
 import requests
+import queue
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from ultralytics import YOLO
 from dotenv import load_dotenv
+from threading import Thread
 
 # =====================
 # Configuração (.env)
@@ -91,6 +92,14 @@ ROI_FILE                 = getenv("OLHARVIVO_ROI_FILE", "roi_config.yaml")
 TELEGRAM_TOKEN  = getenv("OLHARVIVO_TG_TOKEN", None)
 TELEGRAM_CHATID = getenv("OLHARVIVO_TG_CHATID", None)
 
+# Desempenho / qualidade (configuráveis)
+EVENT_JPEG_QUALITY = getenv("OLHARVIVO_EVENT_JPEG_QUALITY", 70, int)  # 1..100
+EVENT_MAX_WIDTH    = getenv("OLHARVIVO_EVENT_MAX_WIDTH", 960, int)     # redimensiona antes de salvar/enviar (0 = desativa)
+ASYNC_IO           = getenv("OLHARVIVO_ASYNC_IO", True, bool)          # salva/enviar em thread separada
+IO_QUEUE_SIZE      = getenv("OLHARVIVO_IO_QUEUE_SIZE", 4, int)
+YOLO_IMGSZ         = getenv("OLHARVIVO_YOLO_IMGSZ", 640, int)          # resolução de inferência
+BLUR_KSIZE         = getenv("OLHARVIVO_BLUR_KSIZE", 11, int)           # ímpar; 0/1 para desativar
+
 # =====================
 # ROI utilitário
 # =====================
@@ -136,6 +145,73 @@ def send_telegram_photo(token, chat_id, filepath, caption=None):
         return False
 
 # =====================
+# Worker assíncrono (IO)
+# =====================
+class EventIOWorker(Thread):
+    def __init__(self, event_dir, tg_token, tg_chatid, jpeg_quality, max_width, q: "queue.Queue"):
+        super().__init__(daemon=True)
+        self.event_dir = event_dir
+        self.tg_token = tg_token
+        self.tg_chatid = tg_chatid
+        self.jpeg_quality = int(max(1, min(100, jpeg_quality)))
+        self.max_width = int(max(0, max_width))
+        self.q = q
+        self.session = requests.Session()
+
+    def _encode_jpeg(self, image_bgr):
+        img = image_bgr
+        if self.max_width and img.shape[1] > self.max_width:
+            scale = self.max_width / float(img.shape[1])
+            new_w = self.max_width
+            new_h = int(round(img.shape[0] * scale))
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality]
+        ok, buf = cv2.imencode(".jpg", img, encode_params)
+        if not ok:
+            raise RuntimeError("Falha no cv2.imencode")
+        return buf.tobytes()
+
+    def run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                self.q.task_done()
+                break
+            annotated, ts = item
+            try:
+                # Codifica JPEG (com redimensionamento opcional)
+                t0 = time.perf_counter()
+                jpeg_bytes = self._encode_jpeg(annotated)
+                t1 = time.perf_counter()
+
+                # Salva em disco
+                filename = os.path.join(self.event_dir, f"evento_{ts}.jpg")
+                with open(filename, "wb") as f:
+                    f.write(jpeg_bytes)
+                t2 = time.perf_counter()
+                logger.info(f"Pessoa detectada — salvo: {filename} (encode {int((t1-t0)*1000)} ms, write {int((t2-t1)*1000)} ms)")
+
+                # Envia Telegram (opcional)
+                if self.tg_token and self.tg_chatid:
+                    try:
+                        url = f"https://api.telegram.org/bot{self.tg_token}/sendPhoto"
+                        files = {"photo": ("evento.jpg", jpeg_bytes, "image/jpeg")}
+                        data = {"chat_id": self.tg_chatid, "caption": f"Olhar Vivo — pessoa detectada em {ts}"}
+                        rt0 = time.perf_counter()
+                        r = self.session.post(url, data=data, files=files, timeout=(3.05, 10))
+                        rt1 = time.perf_counter()
+                        if r.status_code == 200:
+                            logger.info(f"Notificação Telegram enviada ({int((rt1-rt0)*1000)} ms)")
+                        else:
+                            logger.warning(f"Falha Telegram: {r.status_code} {r.text[:120]}")
+                    except Exception as e:
+                        logger.warning(f"Erro no Telegram: {e}")
+            except Exception as e:
+                logger.error(f"Erro no worker IO: {e}")
+            finally:
+                self.q.task_done()
+
+# =====================
 # Inicialização
 # =====================
 def init_camera(index=0, w=1280, h=720):
@@ -152,6 +228,7 @@ def main():
 
     # Modelo YOLO
     try:
+        from ultralytics import YOLO
         model = YOLO(YOLO_MODEL)
     except Exception as e:
         logger.error(f"Erro ao carregar YOLO '{YOLO_MODEL}': {e}")
@@ -171,6 +248,20 @@ def main():
 
     last_capture_time = 0.0
     roi_mask = load_roi_mask(int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), ROI_FILE)
+    roi_overlay = None
+
+    # Blur kernel (configurável)
+    k = int(max(0, BLUR_KSIZE))
+    if k > 1 and (k % 2 == 0):
+        k += 1
+
+    # Fila/worker para IO assíncrono
+    io_q = None
+    io_worker = None
+    if ASYNC_IO:
+        io_q = queue.Queue(maxsize=IO_QUEUE_SIZE)
+        io_worker = EventIOWorker(EVENT_DIR, TELEGRAM_TOKEN, TELEGRAM_CHATID, EVENT_JPEG_QUALITY, EVENT_MAX_WIDTH, io_q)
+        io_worker.start()
 
     try:
         while True:
@@ -182,9 +273,11 @@ def main():
 
             # 1) Pré-processamento e ROI
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (21, 21), 0)
+            if k > 1:
+                gray = cv2.GaussianBlur(gray, (k, k), 0)
             if roi_mask.shape[:2] != gray.shape[:2]:
                 roi_mask = load_roi_mask(gray.shape[1], gray.shape[0], ROI_FILE)
+                roi_overlay = None
             roi_gray = cv2.bitwise_and(gray, roi_mask)
 
             # 2) Movimento
@@ -199,7 +292,7 @@ def main():
 
             # 3) Se há movimento, roda YOLO (apenas classe pessoa=0)
             if motion_detected:
-                results = model(frame, stream=True, classes=0, conf=CONFIDENCE_TH)
+                results = model(frame, stream=True, classes=0, conf=CONFIDENCE_TH, imgsz=YOLO_IMGSZ)
                 for r in results:
                     boxes = r.boxes.cpu().numpy()
                     for b in boxes:
@@ -221,11 +314,25 @@ def main():
             now = time.time()
             if person_confirmed and (now - last_capture_time > CAPTURE_INTERVAL_SECONDS):
                 ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-                fname = os.path.join(EVENT_DIR, f"evento_{ts}.jpg")
                 try:
-                    cv2.imwrite(fname, annotated)
-                    logger.info(f"Pessoa detectada — salvo: {fname}")
-                    send_telegram_photo(TELEGRAM_TOKEN, TELEGRAM_CHATID, fname, f"Olhar Vivo — pessoa detectada em {ts}")
+                    if ASYNC_IO and io_q is not None:
+                        try:
+                            io_q.put_nowait((annotated.copy(), ts))
+                        except queue.Full:
+                            logger.warning("Fila de IO cheia — evento descartado para evitar travamento.")
+                    else:
+                        # Fallback síncrono com compressão
+                        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), int(max(1, min(100, EVENT_JPEG_QUALITY)))]
+                        out_img = annotated
+                        if EVENT_MAX_WIDTH and out_img.shape[1] > EVENT_MAX_WIDTH:
+                            scale = EVENT_MAX_WIDTH / float(out_img.shape[1])
+                            new_w = EVENT_MAX_WIDTH
+                            new_h = int(round(out_img.shape[0] * scale))
+                            out_img = cv2.resize(out_img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        fname = os.path.join(EVENT_DIR, f"evento_{ts}.jpg")
+                        cv2.imwrite(fname, out_img, encode_params)
+                        logger.info(f"Pessoa detectada — salvo: {fname}")
+                        send_telegram_photo(TELEGRAM_TOKEN, TELEGRAM_CHATID, fname, f"Olhar Vivo — pessoa detectada em {ts}")
                 except Exception as e:
                     logger.error(f"Erro ao salvar/alertar: {e}")
                 last_capture_time = now
@@ -236,8 +343,9 @@ def main():
                     disp = frame.copy()
                     # Desenha a ROI na janela para feedback visual
                     if roi_mask is not None:
-                        overlay = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
-                        disp = cv2.addWeighted(disp, 1.0, overlay, 0.2, 0)
+                        if roi_overlay is None:
+                            roi_overlay = cv2.cvtColor(roi_mask, cv2.COLOR_GRAY2BGR)
+                        disp = cv2.addWeighted(disp, 1.0, roi_overlay, 0.2, 0)
                     cv2.imshow("Olhar Vivo — Detecção", disp)
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
@@ -253,6 +361,13 @@ def main():
         except Exception:
             pass
         cv2.destroyAllWindows()
+        # encerra worker
+        try:
+            if ASYNC_IO and io_q is not None:
+                io_q.put_nowait(None)
+                io_q.join()
+        except Exception:
+            pass
         logger.info("Encerrado.")
 
 if __name__ == "__main__":
