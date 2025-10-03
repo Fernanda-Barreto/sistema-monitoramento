@@ -1,19 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Olhar Vivo — main.py (atualizado)
----------------------------------
-Baseado no seu script original, com melhorias:
-- Configuração por .env (python-dotenv)
-- ROI opcional via roi_config.yaml (polígono)
-- Logs com RotatingFileHandler + console
-- Gateamento por movimento (MOG2) antes do YOLO (classes=0/pessoa)
-- Filtros min/max de caixa + razão de aspecto (calibráveis)
-- Cooldown para prints + envio opcional ao Telegram
-- Execução headless opcional (sem janela)
 
-Dependências principais: ultralytics, opencv-python, PyYAML, requests, python-dotenv
-"""
 
 import os
 import cv2
